@@ -8692,11 +8692,34 @@ export default {
   // ==========================================
   // Engine
   // ==========================================
+  // ==========================================
+  // Engine: 0x88 board, search and evaluation
+  // ==========================================
+  // The bot keeps its own board instead of asking chess.js for every move.
+  // chess.js is built for correctness, not speed: generating one move list
+  // costs about a quarter of a millisecond, which caps any search at a few
+  // thousand nodes a second. This engine parses the position from FEN, searches
+  // its own 0x88 board, and hands the chosen move back to chess.js for display.
+  var PAWN = 1;
+  var KNIGHT = 2;
+  var BISHOP = 3;
+  var ROOK = 4;
+  var QUEEN = 5;
+  var KING = 6;
+  var WHITE = 0;
+  var BLACK = 8;
+  var CASTLE_WK = 1;
+  var CASTLE_WQ = 2;
+  var CASTLE_BK = 4;
+  var CASTLE_BQ = 8;
+
   var pieceValues = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 20000 };
   var MATE_SCORE = 1000000;
+  var MATE_LIMIT = MATE_SCORE - 1000;
+  var INFINITY = 1000000000;
 
   // Piece-square tables, written with rank 8 first, so White reads them at
-  // row * 8 + col and Black reads the mirrored row.
+  // (7 - rank) * 8 + file and Black reads them at rank * 8 + file.
   var pieceSquareTable = {
     p: [
         0,   0,   0,   0,   0,   0,   0,   0,
@@ -8760,191 +8783,1024 @@ export default {
     ]
   };
 
-  // The AI currently searching; carries its personality settings.
+  // The king wants the centre once the board is bare.
+  var kingEndTable = [
+    -50, -30, -30, -30, -30, -30, -30, -50,
+    -30, -30,   0,   0,   0,   0, -30, -30,
+    -30,   0,  20,  30,  30,  20,   0, -30,
+    -30,   0,  30,  40,  40,  30,   0, -30,
+    -30,   0,  30,  40,  40,  30,   0, -30,
+    -30,   0,  20,  30,  30,  20,   0, -30,
+    -30, -30,   0,   0,   0,   0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50
+  ];
+
+  var passedPawnBonus = [0, 5, 15, 30, 55, 90, 140, 0];
+  var bishopPairBonus = 30;
+  var rookOpenFile = 18;
+  var rookSemiOpenFile = 9;
+  var doubledPawnPenalty = 12;
+  var isolatedPawnPenalty = 14;
+  var tempoBonus = 8;
+
+  var board = new Array(128);
+  var side = WHITE;
+  var castlingRights = 0;
+  var epSquare = -1;
+  var halfmoveClock = 0;
+  var kingSquares = [4, 116];
+  var searchNodes = 0;
+  var searchNodeLimit = 0;
+  var searchAborted = false;
   var searchProfile = null;
+  var searchQuiesceDepth = 4;
+  var killers = [];
+  var historyTable = [];
+  var lastBestMove = 0;
+  var gameHashCounts = {};
+  var searchHashLo = new Int32Array(160);
+  var searchHashHi = new Int32Array(160);
 
-  function evaluateBoard(g) {
-    if (g.in_checkmate()) return g.turn() === "w" ? -MATE_SCORE : MATE_SCORE;
-    if (g.in_draw()) return 0;
+  // Undo stack, preallocated so a search never allocates per move.
+  var UNDO_DEPTH = 160;
+  var undoPool = [];
+  for (var undoIndex = 0; undoIndex < UNDO_DEPTH; undoIndex++) {
+    undoPool.push({ move: 0, captured: 0, castling: 0, ep: -1, half: 0, kingW: 4, kingB: 116 });
+  }
+  var stackPointer = 0;
 
-    var useTables = !searchProfile || searchProfile.tables;
-    var boardState = g.board();
-    var value = 0;
+  // Deterministic Zobrist keys: two copies of the engine must hash identically.
+  var zobristSeed = 0x1f2e3d4c;
+  function zobristNext() {
+    zobristSeed ^= zobristSeed << 13;
+    zobristSeed >>>= 0;
+    zobristSeed ^= zobristSeed >>> 17;
+    zobristSeed ^= zobristSeed << 5;
+    zobristSeed >>>= 0;
+    return zobristSeed;
+  }
 
+  var ZP_LO = [];
+  var ZP_HI = [];
+  for (var zPiece = 0; zPiece < 16; zPiece++) {
+    var loRow = new Int32Array(128);
+    var hiRow = new Int32Array(128);
+    for (var zSquare = 0; zSquare < 128; zSquare++) {
+      loRow[zSquare] = zobristNext();
+      hiRow[zSquare] = zobristNext();
+    }
+    ZP_LO.push(loRow);
+    ZP_HI.push(hiRow);
+  }
+  var ZS_LO = zobristNext();
+  var ZS_HI = zobristNext();
+  var ZC_LO = new Int32Array(16);
+  var ZC_HI = new Int32Array(16);
+  for (var zCastle = 0; zCastle < 16; zCastle++) {
+    ZC_LO[zCastle] = zobristNext();
+    ZC_HI[zCastle] = zobristNext();
+  }
+  var ZEP_LO = new Int32Array(8);
+  var ZEP_HI = new Int32Array(8);
+  for (var zFile = 0; zFile < 8; zFile++) {
+    ZEP_LO[zFile] = zobristNext();
+    ZEP_HI[zFile] = zobristNext();
+  }
+
+  var hashLo = 0;
+  var hashHi = 0;
+
+  // Transposition table: fixed size, cleared before every search so a repeated
+  // position always produces the same move.
+  var TT_BITS = 18;
+  var TT_SIZE = 1 << TT_BITS;
+  var TT_MASK = TT_SIZE - 1;
+  var ttKeyLo = new Int32Array(TT_SIZE);
+  var ttKeyHi = new Int32Array(TT_SIZE);
+  var ttDepth = new Int8Array(TT_SIZE);
+  var ttFlag = new Int8Array(TT_SIZE);
+  var ttScore = new Int32Array(TT_SIZE);
+  var ttMove = new Int32Array(TT_SIZE);
+  var TT_EXACT = 1;
+  var TT_LOWER = 2;
+  var TT_UPPER = 3;
+
+  function typeOf(piece) { return piece & 7; }
+  function colorOf(piece) { return piece & 8; }
+  function onBoard(square) { return (square & 0x88) === 0; }
+
+  function put(square, piece) {
+    var old = board[square];
+    if (old) {
+      hashLo ^= ZP_LO[old][square];
+      hashHi ^= ZP_HI[old][square];
+    }
+    board[square] = piece;
+    if (piece) {
+      hashLo ^= ZP_LO[piece][square];
+      hashHi ^= ZP_HI[piece][square];
+    }
+  }
+
+  function setEp(square) {
+    if (epSquare >= 0) {
+      hashLo ^= ZEP_LO[epSquare & 7];
+      hashHi ^= ZEP_HI[epSquare & 7];
+    }
+    epSquare = square;
+    if (square >= 0) {
+      hashLo ^= ZEP_LO[square & 7];
+      hashHi ^= ZEP_HI[square & 7];
+    }
+  }
+
+  function setCastling(rights) {
+    hashLo ^= ZC_LO[castlingRights] ^ ZC_LO[rights];
+    hashHi ^= ZC_HI[castlingRights] ^ ZC_HI[rights];
+    castlingRights = rights;
+  }
+
+  function flipSide() {
+    hashLo ^= ZS_LO;
+    hashHi ^= ZS_HI;
+    side = side === WHITE ? BLACK : WHITE;
+  }
+
+  function loadFen(fen) {
+    for (var i = 0; i < 128; i++) board[i] = 0;
+    var parts = String(fen).split(/\s+/);
+    var rows = parts[0].split("/");
     for (var r = 0; r < 8; r++) {
-      for (var c = 0; c < 8; c++) {
-        var piece = boardState[r][c];
-        if (!piece) continue;
-        var score = pieceValues[piece.type];
-        if (useTables) {
-          var table = pieceSquareTable[piece.type];
-          if (table) {
-            score += table[piece.color === "w" ? r * 8 + c : (7 - r) * 8 + c];
+      var file = 0;
+      var row = rows[r];
+      for (var c = 0; c < row.length; c++) {
+        var ch = row.charAt(c);
+        if (ch >= "1" && ch <= "8") {
+          file += parseInt(ch, 10);
+          continue;
+        }
+        var code = 0;
+        var lower = ch.toLowerCase();
+        if (lower === "p") code = PAWN;
+        else if (lower === "n") code = KNIGHT;
+        else if (lower === "b") code = BISHOP;
+        else if (lower === "r") code = ROOK;
+        else if (lower === "q") code = QUEEN;
+        else if (lower === "k") code = KING;
+        if (ch === ch.toUpperCase()) code |= WHITE;
+        else code |= BLACK;
+        // FEN lists rank 8 first, while 0x88 uses a1 as square 0.
+        var squareIndex = (7 - r) * 16 + file;
+        board[squareIndex] = code;
+        if (typeOf(code) === KING) kingSquares[ch === ch.toUpperCase() ? 0 : 1] = squareIndex;
+        file++;
+      }
+    }
+    side = parts[1] === "b" ? BLACK : WHITE;
+    castlingRights = 0;
+    if (parts[2] && parts[2] !== "-") {
+      if (parts[2].indexOf("K") !== -1) castlingRights |= CASTLE_WK;
+      if (parts[2].indexOf("Q") !== -1) castlingRights |= CASTLE_WQ;
+      if (parts[2].indexOf("k") !== -1) castlingRights |= CASTLE_BK;
+      if (parts[2].indexOf("q") !== -1) castlingRights |= CASTLE_BQ;
+    }
+    epSquare = -1;
+    if (parts[3] && parts[3] !== "-") {
+      var epFile = parts[3].charAt(0).charCodeAt(0) - 97;
+      var epRank = parseInt(parts[3].charAt(1), 10);
+      epSquare = (epRank - 1) * 16 + epFile;
+    }
+    halfmoveClock = parts[4] ? parseInt(parts[4], 10) || 0 : 0;
+
+    hashLo = 0;
+    hashHi = 0;
+    for (var sq = 0; sq < 120; sq++) {
+      if (sq & 0x88) continue;
+      var p = board[sq];
+      if (!p) continue;
+      hashLo ^= ZP_LO[p][sq];
+      hashHi ^= ZP_HI[p][sq];
+    }
+    hashLo ^= ZC_LO[castlingRights];
+    hashHi ^= ZC_HI[castlingRights];
+    if (epSquare >= 0) {
+      hashLo ^= ZEP_LO[epSquare & 7];
+      hashHi ^= ZEP_HI[epSquare & 7];
+    }
+    if (side === BLACK) {
+      hashLo ^= ZS_LO;
+      hashHi ^= ZS_HI;
+    }
+    stackPointer = 0;
+  }
+
+  var KNIGHT_OFFSETS = [33, 31, 18, 14, -33, -31, -18, -14];
+  var KING_OFFSETS = [17, 16, 15, 1, -1, -15, -16, -17];
+  var DIAGONALS = [17, 15, -17, -15];
+  var STRAIGHT = [16, -16, 1, -1];
+
+  function attacked(square, byColor) {
+    var i;
+    if (byColor === WHITE) {
+      if (onBoard(square - 15) && board[square - 15] === (WHITE | PAWN)) return true;
+      if (onBoard(square - 17) && board[square - 17] === (WHITE | PAWN)) return true;
+    } else {
+      if (onBoard(square + 15) && board[square + 15] === (BLACK | PAWN)) return true;
+      if (onBoard(square + 17) && board[square + 17] === (BLACK | PAWN)) return true;
+    }
+
+    for (i = 0; i < 8; i++) {
+      var kn = square + KNIGHT_OFFSETS[i];
+      if (onBoard(kn) && board[kn] === (byColor | KNIGHT)) return true;
+    }
+    for (i = 0; i < 8; i++) {
+      var kg = square + KING_OFFSETS[i];
+      if (onBoard(kg) && board[kg] === (byColor | KING)) return true;
+    }
+    for (i = 0; i < 4; i++) {
+      var ray = square + DIAGONALS[i];
+      while (onBoard(ray)) {
+        var target = board[ray];
+        if (target) {
+          if (colorOf(target) === byColor) {
+            var diagonalType = typeOf(target);
+            if (diagonalType === BISHOP || diagonalType === QUEEN) return true;
+          }
+          break;
+        }
+        ray += DIAGONALS[i];
+      }
+    }
+    for (i = 0; i < 4; i++) {
+      var line = square + STRAIGHT[i];
+      while (onBoard(line)) {
+        var blocker = board[line];
+        if (blocker) {
+          if (colorOf(blocker) === byColor) {
+            var straightType = typeOf(blocker);
+            if (straightType === ROOK || straightType === QUEEN) return true;
+          }
+          break;
+        }
+        line += STRAIGHT[i];
+      }
+    }
+    return false;
+  }
+
+  function inCheck() {
+    return attacked(kingSquares[side === WHITE ? 0 : 1], side === WHITE ? BLACK : WHITE);
+  }
+
+  function encodeMove(from, to, promotion, isEp, isCastle) {
+    return from | (to << 7) | ((promotion || 0) << 14) | ((isEp ? 1 : 0) << 17) | ((isCastle ? 1 : 0) << 18);
+  }
+
+  function generateMoves(capturesOnly) {
+    var list = [];
+    var us = side;
+    var them = side === WHITE ? BLACK : WHITE;
+    var forward = side === WHITE ? 16 : -16;
+    var promoStart = side === WHITE ? 96 : 16;
+    var promoEnd = side === WHITE ? 103 : 23;
+    var startRank = side === WHITE ? 16 : 96;
+    var startEnd = side === WHITE ? 23 : 103;
+
+    for (var square = 0; square < 120; square++) {
+      if (square & 0x88) continue;
+      var piece = board[square];
+      if (!piece || colorOf(piece) !== us) continue;
+      var pieceType = typeOf(piece);
+
+      if (pieceType === PAWN) {
+        var oneStep = square + forward;
+        var promoting = square >= promoStart && square <= promoEnd;
+        if (!capturesOnly && onBoard(oneStep) && !board[oneStep]) {
+          if (promoting) {
+            list.push(encodeMove(square, oneStep, QUEEN, false, false));
+            list.push(encodeMove(square, oneStep, ROOK, false, false));
+            list.push(encodeMove(square, oneStep, BISHOP, false, false));
+            list.push(encodeMove(square, oneStep, KNIGHT, false, false));
+          } else {
+            list.push(encodeMove(square, oneStep, 0, false, false));
+            var twoStep = oneStep + forward;
+            if (square >= startRank && square <= startEnd && !board[twoStep]) {
+              list.push(encodeMove(square, twoStep, 0, false, false));
+            }
           }
         }
-        value += piece.color === "w" ? score : -score;
+        if (promoting) {
+          for (var pc = 0; pc < 2; pc++) {
+            var promoSquare = square + forward + (pc === 0 ? -1 : 1);
+            if (!onBoard(promoSquare)) continue;
+            var promoVictim = board[promoSquare];
+            if (!promoVictim || colorOf(promoVictim) !== them) continue;
+            list.push(encodeMove(square, promoSquare, QUEEN, false, false));
+            list.push(encodeMove(square, promoSquare, ROOK, false, false));
+            list.push(encodeMove(square, promoSquare, BISHOP, false, false));
+            list.push(encodeMove(square, promoSquare, KNIGHT, false, false));
+          }
+        } else {
+          for (var k = 0; k < 2; k++) {
+            var targetSquare = square + forward + (k === 0 ? -1 : 1);
+            if (!onBoard(targetSquare)) continue;
+            var victim = board[targetSquare];
+            if (victim && colorOf(victim) === them) {
+              list.push(encodeMove(square, targetSquare, 0, false, false));
+            } else if (!victim && targetSquare === epSquare) {
+              list.push(encodeMove(square, targetSquare, 0, true, false));
+            }
+          }
+        }
+        continue;
+      }
+
+      if (pieceType === KNIGHT || pieceType === KING) {
+        var steps = pieceType === KNIGHT ? KNIGHT_OFFSETS : KING_OFFSETS;
+        for (var n = 0; n < 8; n++) {
+          var to = square + steps[n];
+          if (!onBoard(to)) continue;
+          var occupant = board[to];
+          if (occupant && colorOf(occupant) === us) continue;
+          if (capturesOnly && !occupant) continue;
+          list.push(encodeMove(square, to, 0, false, false));
+        }
+        if (pieceType === KING && !capturesOnly) {
+          if (us === WHITE && square === 4) {
+            if ((castlingRights & CASTLE_WK) && !board[5] && !board[6] &&
+                board[7] === (WHITE | ROOK) &&
+                !attacked(4, BLACK) && !attacked(5, BLACK) && !attacked(6, BLACK)) {
+              list.push(encodeMove(4, 6, 0, false, true));
+            }
+            if ((castlingRights & CASTLE_WQ) && !board[3] && !board[2] && !board[1] &&
+                board[0] === (WHITE | ROOK) &&
+                !attacked(4, BLACK) && !attacked(3, BLACK) && !attacked(2, BLACK)) {
+              list.push(encodeMove(4, 2, 0, false, true));
+            }
+          } else if (us === BLACK && square === 116) {
+            if ((castlingRights & CASTLE_BK) && !board[117] && !board[118] &&
+                board[119] === (BLACK | ROOK) &&
+                !attacked(116, WHITE) && !attacked(117, WHITE) && !attacked(118, WHITE)) {
+              list.push(encodeMove(116, 118, 0, false, true));
+            }
+            if ((castlingRights & CASTLE_BQ) && !board[115] && !board[114] && !board[113] &&
+                board[112] === (BLACK | ROOK) &&
+                !attacked(116, WHITE) && !attacked(115, WHITE) && !attacked(114, WHITE)) {
+              list.push(encodeMove(116, 114, 0, false, true));
+            }
+          }
+        }
+        continue;
+      }
+
+      var directions;
+      if (pieceType === BISHOP) directions = DIAGONALS;
+      else if (pieceType === ROOK) directions = STRAIGHT;
+      else directions = KING_OFFSETS;
+      for (var di = 0; di < directions.length; di++) {
+        var squareOnRay = square + directions[di];
+        while (onBoard(squareOnRay)) {
+          var hit = board[squareOnRay];
+          if (hit) {
+            if (colorOf(hit) === them) list.push(encodeMove(square, squareOnRay, 0, false, false));
+            break;
+          }
+          if (!capturesOnly) list.push(encodeMove(square, squareOnRay, 0, false, false));
+          squareOnRay += directions[di];
+        }
       }
     }
-    return value;
+    return list;
   }
 
-  function orderMoves(g, moves) {
-    return moves
-      .map(function (move) {
-        var target = g.get(move.to);
-        var score = target ? pieceValues[target.type] : 0;
-        if (move.captured) score += 50;
-        if (move.promotion) score += 800;
-        return { move: move, score: score };
-      })
-      .sort(function (a, b) { return b.score - a.score; })
-      .map(function (entry) { return entry.move; });
-  }
+  function makeMove(move) {
+    var from = move & 127;
+    var to = (move >> 7) & 127;
+    var promotion = (move >> 14) & 7;
+    var isEp = (move >> 17) & 1;
+    var isCastle = (move >> 18) & 1;
+    var us = side;
+    var undo = undoPool[stackPointer];
+    undo.move = move;
+    undo.captured = board[to];
+    undo.castling = castlingRights;
+    undo.ep = epSquare;
+    undo.half = halfmoveClock;
+    undo.kingW = kingSquares[0];
+    undo.kingB = kingSquares[1];
+    stackPointer++;
 
-  // Strong profiles keep resolving captures past the nominal depth, so they
-  // never stop the search in the middle of an exchange.
-  // A soft deadline: a search that runs out of time scores the position it has
-  // reached instead of recursing further, so the bot always answers promptly and
-  // every move is still undone cleanly.
-  var searchDeadline = 0;
+    setEp(-1);
+    var movingPiece = board[from];
+    var isPawnMove = typeOf(movingPiece) === PAWN && !isCastle;
+    var capturedPiece = board[to];
 
-  function outOfTime() {
-    return searchDeadline > 0 && Date.now() > searchDeadline;
-  }
-
-  function quiesce(g, alpha, beta, depth) {
-    if (outOfTime()) return evaluateBoard(g);
-    var stand = evaluateBoard(g);
-    if (depth === 0 || g.game_over()) return stand;
-
-    if (g.turn() === "w") {
-      if (stand >= beta) return beta;
-      if (stand > alpha) alpha = stand;
+    if (isCastle) {
+      put(from, 0);
+      put(to, movingPiece);
+      var rookFrom;
+      var rookTo;
+      if (to > from) { rookFrom = from + 3; rookTo = from + 1; }
+      else { rookFrom = from - 4; rookTo = from - 1; }
+      put(rookFrom, 0);
+      put(rookTo, us | ROOK);
+      kingSquares[us === WHITE ? 0 : 1] = to;
+    } else if (isEp) {
+      put(from, 0);
+      put(to, movingPiece);
+      var capturedSquare = to + (us === WHITE ? -16 : 16);
+      capturedPiece = board[capturedSquare];
+      put(capturedSquare, 0);
     } else {
-      if (stand <= alpha) return alpha;
-      if (stand < beta) beta = stand;
-    }
-
-    var moves = orderMoves(g, g.moves({ verbose: true }).filter(function (move) {
-      return move.captured || move.promotion;
-    }));
-    if (!moves.length) return stand;
-
-    if (g.turn() === "w") {
-      var best = stand;
-      for (var i = 0; i < moves.length; i++) {
-        g.move(moves[i]);
-        best = Math.max(best, quiesce(g, alpha, beta, depth - 1));
-        g.undo();
-        alpha = Math.max(alpha, best);
-        if (beta <= alpha) break;
+      put(from, 0);
+      put(to, promotion ? (promotion | us) : movingPiece);
+      if (typeOf(movingPiece) === KING) kingSquares[us === WHITE ? 0 : 1] = to;
+      if (isPawnMove && Math.abs(to - from) === 32) {
+        setEp(from + (us === WHITE ? 16 : -16));
       }
-      return best;
     }
 
-    var worst = stand;
-    for (var j = 0; j < moves.length; j++) {
-      g.move(moves[j]);
-      worst = Math.min(worst, quiesce(g, alpha, beta, depth - 1));
-      g.undo();
-      beta = Math.min(beta, worst);
-      if (beta <= alpha) break;
-    }
-    return worst;
+    var rights = castlingRights;
+    if (from === 4 || to === 4) rights &= ~(CASTLE_WK | CASTLE_WQ);
+    if (from === 7 || to === 7) rights &= ~CASTLE_WK;
+    if (from === 0 || to === 0) rights &= ~CASTLE_WQ;
+    if (from === 116 || to === 116) rights &= ~(CASTLE_BK | CASTLE_BQ);
+    if (from === 119 || to === 119) rights &= ~CASTLE_BK;
+    if (from === 112 || to === 112) rights &= ~CASTLE_BQ;
+    setCastling(rights);
+
+    if (isPawnMove || capturedPiece) halfmoveClock = 0;
+    else halfmoveClock++;
+
+    flipSide();
   }
 
-  function alphaBeta(g, depth, alpha, beta) {
-    if (outOfTime()) return evaluateBoard(g);
-    if (depth === 0 || g.game_over()) {
-      return searchProfile && searchProfile.quiesce
-        ? quiesce(g, alpha, beta, searchProfile.quiesceDepth || 2)
-        : evaluateBoard(g);
+  function unmakeMove() {
+    stackPointer--;
+    var undo = undoPool[stackPointer];
+    var move = undo.move;
+    var from = move & 127;
+    var to = (move >> 7) & 127;
+    var promotion = (move >> 14) & 7;
+    var isEp = (move >> 17) & 1;
+    var isCastle = (move >> 18) & 1;
+    flipSide();
+    var us = side;
+
+    if (isCastle) {
+      put(to, 0);
+      put(from, us | KING);
+      var rookFrom;
+      var rookTo;
+      if (to > from) { rookFrom = from + 3; rookTo = from + 1; }
+      else { rookFrom = from - 4; rookTo = from - 1; }
+      put(rookTo, 0);
+      put(rookFrom, us | ROOK);
+    } else if (isEp) {
+      put(to, 0);
+      put(from, us | PAWN);
+      put(to + (us === WHITE ? -16 : 16), (us === WHITE ? BLACK : WHITE) | PAWN);
+    } else {
+      var movedPiece = board[to];
+      put(to, 0);
+      put(from, promotion ? (us | PAWN) : movedPiece);
+      if (undo.captured) put(to, undo.captured);
     }
 
-    var moves = orderMoves(g, g.moves({ verbose: true }));
-    if (moves.length === 0) return evaluateBoard(g);
-
-    if (g.turn() === "w") {
-      var bestWhite = -Infinity;
-      for (var i = 0; i < moves.length; i++) {
-        g.move(moves[i]);
-        bestWhite = Math.max(bestWhite, alphaBeta(g, depth - 1, alpha, beta));
-        g.undo();
-        alpha = Math.max(alpha, bestWhite);
-        if (beta <= alpha) break;
-      }
-      return bestWhite;
-    }
-
-    var bestBlack = Infinity;
-    for (var j = 0; j < moves.length; j++) {
-      g.move(moves[j]);
-      bestBlack = Math.min(bestBlack, alphaBeta(g, depth - 1, alpha, beta));
-      g.undo();
-      beta = Math.min(beta, bestBlack);
-      if (beta <= alpha) break;
-    }
-    return bestBlack;
+    setCastling(undo.castling);
+    setEp(undo.ep);
+    halfmoveClock = undo.half;
+    kingSquares[0] = undo.kingW;
+    kingSquares[1] = undo.kingB;
   }
 
-  function chooseRootMove(g, depth, slack) {
-    var moves = g.moves({ verbose: true });
-    if (moves.length === 0) return null;
+  function makeNullMove() {
+    var undo = undoPool[stackPointer];
+    undo.move = 0;
+    undo.captured = 0;
+    undo.castling = castlingRights;
+    undo.ep = epSquare;
+    undo.half = halfmoveClock;
+    undo.kingW = kingSquares[0];
+    undo.kingB = kingSquares[1];
+    stackPointer++;
+    setEp(-1);
+    flipSide();
+  }
 
-    // Shuffle so equal-valued moves are not always played in the same order.
-    // The final profile skips this: identical positions must give identical moves,
-    // which is what makes two copies of it draw instead of one winning.
-    if (!(searchProfile && searchProfile.deterministic)) {
-      for (var k = moves.length - 1; k > 0; k--) {
-        var j = Math.floor(Math.random() * (k + 1));
-        var tmp = moves[k];
-        moves[k] = moves[j];
-        moves[j] = tmp;
+  function unmakeNullMove() {
+    stackPointer--;
+    var undo = undoPool[stackPointer];
+    flipSide();
+    setCastling(undo.castling);
+    setEp(undo.ep);
+    halfmoveClock = undo.half;
+    kingSquares[0] = undo.kingW;
+    kingSquares[1] = undo.kingB;
+  }
+
+  function hasNonPawnMaterial(color) {
+    for (var square = 0; square < 120; square++) {
+      if (square & 0x88) continue;
+      var piece = board[square];
+      if (!piece || colorOf(piece) !== color) continue;
+      var pieceType = typeOf(piece);
+      if (pieceType !== PAWN && pieceType !== KING) return true;
+    }
+    return false;
+  }
+
+  function evaluateWhite() {
+    var useTables = !searchProfile || searchProfile.tables !== false;
+    var white = 0;
+    var black = 0;
+    var phaseMaterial = 0;
+    var pawnFileW = [0, 0, 0, 0, 0, 0, 0, 0];
+    var pawnFileB = [0, 0, 0, 0, 0, 0, 0, 0];
+    var pawnsW = [];
+    var pawnsB = [];
+    var bishopsW = 0;
+    var bishopsB = 0;
+
+    for (var square = 0; square < 120; square++) {
+      if (square & 0x88) continue;
+      var piece = board[square];
+      if (!piece) continue;
+      var whiteSide = colorOf(piece) === WHITE;
+      var rank = square >> 4;
+      var file = square & 7;
+      var tableIndex = whiteSide ? (7 - rank) * 8 + file : rank * 8 + file;
+      var pieceType = typeOf(piece);
+      var score = 0;
+      var tableKey = "p";
+
+      if (pieceType === PAWN) {
+        score = pieceValues.p;
+        if (whiteSide) {
+          pawnFileW[file]++;
+          pawnsW.push(square);
+        } else {
+          pawnFileB[file]++;
+          pawnsB.push(square);
+        }
+        tableKey = "p";
+      } else if (pieceType === KING) {
+        score = 0;
+        continue;
+      } else {
+        tableKey = pieceType === KNIGHT ? "n" : pieceType === BISHOP ? "b" : pieceType === ROOK ? "r" : "q";
+        score = pieceValues[tableKey];
+        phaseMaterial += score;
+        if (pieceType === BISHOP) {
+          if (whiteSide) bishopsW++;
+          else bishopsB++;
+        }
+        if (pieceType === ROOK) {
+          var ownPawns = whiteSide ? pawnFileW[file] : pawnFileB[file];
+          var enemyPawns = whiteSide ? pawnFileB[file] : pawnFileW[file];
+          if (ownPawns === 0 && enemyPawns === 0) score += rookOpenFile;
+          else if (ownPawns === 0) score += rookSemiOpenFile;
+        }
+      }
+      if (useTables) score += pieceSquareTable[tableKey][tableIndex];
+      if (whiteSide) white += score;
+      else black += score;
+    }
+
+    var phase = Math.min(1, phaseMaterial / 4100);
+    var kingW = kingSquares[0];
+    var kingB = kingSquares[1];
+    var kingWIndex = (7 - (kingW >> 4)) * 8 + (kingW & 7);
+    var kingBIndex = (kingB >> 4) * 8 + (kingB & 7);
+    white += pieceSquareTable.k[kingWIndex] * phase + kingEndTable[kingWIndex] * (1 - phase);
+    black += pieceSquareTable.k[kingBIndex] * phase + kingEndTable[kingBIndex] * (1 - phase);
+
+    var i;
+    for (i = 0; i < 8; i++) {
+      if (pawnFileW[i] > 1) white -= doubledPawnPenalty * (pawnFileW[i] - 1);
+      if (pawnFileB[i] > 1) black -= doubledPawnPenalty * (pawnFileB[i] - 1);
+      if (pawnFileW[i] > 0 && !(i > 0 && pawnFileW[i - 1]) && !(i < 7 && pawnFileW[i + 1])) white -= isolatedPawnPenalty;
+      if (pawnFileB[i] > 0 && !(i > 0 && pawnFileB[i - 1]) && !(i < 7 && pawnFileB[i + 1])) black -= isolatedPawnPenalty;
+    }
+
+    for (i = 0; i < pawnsW.length; i++) {
+      var wPawn = pawnsW[i];
+      var blockedW = false;
+      for (var b = 0; b < pawnsB.length; b++) {
+        if (Math.abs((pawnsB[b] & 7) - (wPawn & 7)) <= 1 && (pawnsB[b] >> 4) < (wPawn >> 4)) { blockedW = true; break; }
+      }
+      if (!blockedW) white += passedPawnBonus[Math.max(0, Math.min(6, 6 - (wPawn >> 4)))];
+    }
+    for (i = 0; i < pawnsB.length; i++) {
+      var bPawn = pawnsB[i];
+      var blockedB = false;
+      for (var w = 0; w < pawnsW.length; w++) {
+        if (Math.abs((pawnsW[w] & 7) - (bPawn & 7)) <= 1 && (pawnsW[w] >> 4) > (bPawn >> 4)) { blockedB = true; break; }
+      }
+      if (!blockedB) black += passedPawnBonus[Math.max(0, Math.min(6, (bPawn >> 4) - 1))];
+    }
+
+    if (bishopsW >= 2) white += bishopPairBonus;
+    if (bishopsB >= 2) black += bishopPairBonus;
+
+    white -= pawnShield(pawnsW, kingW, WHITE) * phase;
+    black -= pawnShield(pawnsB, kingB, BLACK) * phase;
+
+    return Math.round(white - black + (side === WHITE ? tempoBonus : -tempoBonus));
+  }
+
+  function pawnShield(pawns, kingSquare, color) {
+    var kingFile = kingSquare & 7;
+    var kingRank = kingSquare >> 4;
+    var penalty = 0;
+    for (var file = kingFile - 1; file <= kingFile + 1; file++) {
+      if (file < 0 || file > 7) continue;
+      var covered = false;
+      for (var i = 0; i < pawns.length; i++) {
+        if ((pawns[i] & 7) !== file) continue;
+        var ahead = color === WHITE ? kingRank - (pawns[i] >> 4) : (pawns[i] >> 4) - kingRank;
+        if (ahead >= 1 && ahead <= 2) { covered = true; break; }
+      }
+      if (!covered) penalty += 12;
+    }
+    return penalty;
+  }
+
+  function evaluateForTurn() {
+    var value = evaluateWhite();
+    return side === WHITE ? value : -value;
+  }
+
+  function moveOrderScore(move, ttBest, ply) {
+    if (move === ttBest) return 1000000000;
+    var from = move & 127;
+    var to = (move >> 7) & 127;
+    var promotion = (move >> 14) & 7;
+    var isEp = (move >> 17) & 1;
+    var target = board[to];
+    if (target || isEp) {
+      var victimType = isEp ? PAWN : typeOf(target);
+      var victimValue = victimType === PAWN ? 100 : victimType === KNIGHT ? 320 : victimType === BISHOP ? 330 : victimType === ROOK ? 500 : 900;
+      var attackerType = typeOf(board[from]);
+      var attackerValue = attackerType === PAWN ? 100 : attackerType === KNIGHT ? 320 : attackerType === BISHOP ? 330 : attackerType === ROOK ? 500 : attackerType === QUEEN ? 900 : 20000;
+      return 1000000 + victimValue * 10 - attackerValue;
+    }
+    if (promotion) {
+      var promoValue = promotion === QUEEN ? 900 : promotion === ROOK ? 500 : promotion === BISHOP ? 330 : 320;
+      return 900000 + promoValue;
+    }
+    var slot = killers[ply];
+    if (slot) {
+      if (slot[0] === move) return 800000;
+      if (slot[1] === move) return 799000;
+    }
+    return historyTable[from * 128 + to] || 0;
+  }
+
+  var orderScores = [];
+  function orderMoves(list, ttBest, ply) {
+    var n = list.length;
+    if (n < 2) return list;
+    orderScores.length = n;
+    for (var i = 0; i < n; i++) orderScores[i] = moveOrderScore(list[i], ttBest, ply);
+    for (var j = 1; j < n; j++) {
+      var move = list[j];
+      var score = orderScores[j];
+      var k = j - 1;
+      while (k >= 0 && orderScores[k] < score) {
+        list[k + 1] = list[k];
+        orderScores[k + 1] = orderScores[k];
+        k--;
+      }
+      list[k + 1] = move;
+      orderScores[k + 1] = score;
+    }
+    return list;
+  }
+
+  function ttClear() {
+    ttKeyLo.fill(0);
+    ttKeyHi.fill(0);
+    ttDepth.fill(0);
+    ttFlag.fill(0);
+    ttScore.fill(0);
+    ttMove.fill(0);
+  }
+
+  function ttProbe(alpha, beta, depth, ply) {
+    var index = (hashLo ^ (hashHi >>> 13)) & TT_MASK;
+    if (ttKeyLo[index] !== hashLo || ttKeyHi[index] !== hashHi) return null;
+    var storedDepth = ttDepth[index];
+    var storedScore = ttScore[index];
+    var flag = ttFlag[index];
+    if (storedScore > MATE_LIMIT) storedScore -= ply;
+    else if (storedScore < -MATE_LIMIT) storedScore += ply;
+    if (storedDepth >= depth) {
+      if (flag === TT_EXACT) return { score: storedScore, move: ttMove[index], done: true };
+      if (flag === TT_LOWER && storedScore >= beta) return { score: storedScore, move: ttMove[index], done: true };
+      if (flag === TT_UPPER && storedScore <= alpha) return { score: storedScore, move: ttMove[index], done: true };
+    }
+    return { score: 0, move: ttMove[index], done: false };
+  }
+
+  function ttStore(depth, score, flag, move, ply) {
+    var index = (hashLo ^ (hashHi >>> 13)) & TT_MASK;
+    ttKeyLo[index] = hashLo;
+    ttKeyHi[index] = hashHi;
+    ttDepth[index] = depth;
+    ttFlag[index] = flag;
+    var storedScore = score;
+    if (storedScore > MATE_LIMIT) storedScore += ply;
+    else if (storedScore < -MATE_LIMIT) storedScore -= ply;
+    ttScore[index] = storedScore;
+    ttMove[index] = move;
+  }
+
+  function checkNodeLimit() {
+    if (searchNodeLimit > 0 && searchNodes >= searchNodeLimit) {
+      searchAborted = true;
+      return true;
+    }
+    return false;
+  }
+
+  function quiesce(alpha, beta, ply, qdepth) {
+    searchNodes++;
+    if (checkNodeLimit()) return 0;
+
+    var checked = inCheck();
+    var standPat = checked ? -MATE_SCORE + ply : evaluateForTurn();
+    if (!checked) {
+      if (standPat >= beta) return standPat;
+      if (standPat > alpha) alpha = standPat;
+      if (qdepth >= searchQuiesceDepth) return standPat;
+    } else if (qdepth >= searchQuiesceDepth) {
+      return evaluateForTurn();
+    }
+
+    var moves = generateMoves(!checked);
+    if (moves.length === 0) return checked ? -MATE_SCORE + ply : standPat;
+    orderMoves(moves, 0, Math.min(ply, 31));
+
+    var best = standPat;
+    for (var i = 0; i < moves.length; i++) {
+      var move = moves[i];
+      var mover = side;
+      makeMove(move);
+      if (attacked(kingSquares[mover === WHITE ? 0 : 1], mover === WHITE ? BLACK : WHITE)) {
+        unmakeMove();
+        continue;
+      }
+      var score = -quiesce(-beta, -alpha, ply + 1, qdepth + 1);
+      unmakeMove();
+      if (searchAborted) return best;
+      if (score > best) best = score;
+      if (score > alpha) alpha = score;
+      if (alpha >= beta) break;
+    }
+    return best;
+  }
+
+  function search(depth, alpha, beta, ply, allowNull) {
+    searchNodes++;
+    if (checkNodeLimit()) return 0;
+    if (halfmoveClock >= 100) return 0;
+
+    // Twofold repetition inside the search line is scored as a draw, so the
+    // engine never shuffles instead of converting a won position.
+    if (ply > 0) {
+      for (var repeatAt = stackPointer - 2; repeatAt >= 0; repeatAt -= 2) {
+        if (searchHashLo[repeatAt] === hashLo && searchHashHi[repeatAt] === hashHi) return 0;
       }
     }
-    moves = orderMoves(g, moves);
+    if (stackPointer < 160) {
+      searchHashLo[stackPointer] = hashLo;
+      searchHashHi[stackPointer] = hashHi;
+    }
 
-    var whiteToMove = g.turn() === "w";
-    var deterministic = !!(searchProfile && searchProfile.deterministic);
-    var alpha = -Infinity;
-    var beta = Infinity;
-    var scored = [];
+    var checked = inCheck();
+    if (checked && ply < 28) depth++;
+    if (depth <= 0) return quiesce(alpha, beta, ply, 0);
+
+    var probe = ttProbe(alpha, beta, depth, ply);
+    var ttBest = probe ? probe.move : 0;
+    if (probe && probe.done) return probe.score;
+
+    var moves = generateMoves(false);
+    if (moves.length === 0) return checked ? -MATE_SCORE + ply : 0;
+
+    // Null move pruning: if handing the opponent a free move still leaves a
+    // comfortable score, this branch cannot be best.
+    if (allowNull && !checked && depth >= 3 && ply > 0 && hasNonPawnMaterial(side)) {
+      var staticEval = evaluateForTurn();
+      if (staticEval >= beta) {
+        makeNullMove();
+        var nullScore = -search(depth - 3, -beta, -beta + 1, ply + 1, false);
+        unmakeNullMove();
+        if (searchAborted) return 0;
+        if (nullScore >= beta) return nullScore;
+      }
+    }
+
+    orderMoves(moves, ttBest, Math.min(ply, 31));
+    var best = -INFINITY;
+    var bestMove = moves[0];
+    var originalAlpha = alpha;
+    var legalMoves = 0;
 
     for (var i = 0; i < moves.length; i++) {
-      g.move(moves[i]);
-      // The shuffle is skipped for a deterministic profile, so the move order is
-      // fixed and the same position always produces the same scored values.
-      var value = alphaBeta(g, depth - 1, alpha, beta);
-      g.undo();
-      scored.push({ move: moves[i], value: value });
-      if (whiteToMove) alpha = Math.max(alpha, value);
-      else beta = Math.min(beta, value);
+      var move = moves[i];
+      var target = board[(move >> 7) & 127];
+      var quiet = !target && !((move >> 17) & 1) && !((move >> 14) & 7);
+      var mover = side;
+      makeMove(move);
+      if (attacked(kingSquares[mover === WHITE ? 0 : 1], mover === WHITE ? BLACK : WHITE)) {
+        unmakeMove();
+        continue;
+      }
+      legalMoves++;
+
+      var score;
+      var reduce = depth >= 3 && i >= 4 && quiet && !checked ? (i >= 8 && depth >= 4 ? 2 : 1) : 0;
+      if (i === 0) {
+        score = -search(depth - 1, -beta, -alpha, ply + 1, true);
+      } else if (reduce > 0) {
+        score = -search(depth - 1 - reduce, -alpha - 1, -alpha, ply + 1, true);
+        if (!searchAborted && score > alpha) {
+          score = -search(depth - 1, -beta, -alpha, ply + 1, true);
+        }
+      } else {
+        score = -search(depth - 1, -alpha - 1, -alpha, ply + 1, true);
+        if (!searchAborted && score > alpha && score < beta) {
+          score = -search(depth - 1, -beta, -alpha, ply + 1, true);
+        }
+      }
+      unmakeMove();
+      if (searchAborted) return 0;
+
+      if (score > best) {
+        best = score;
+        bestMove = move;
+      }
+      if (score > alpha) {
+        alpha = score;
+        if (quiet) {
+          var historyIndex = (move & 127) * 128 + ((move >> 7) & 127);
+          historyTable[historyIndex] = (historyTable[historyIndex] || 0) + depth * depth;
+        }
+      }
+      if (alpha >= beta) {
+        if (quiet) {
+          var killer = killers[Math.min(ply, 31)] || (killers[Math.min(ply, 31)] = []);
+          if (killer[0] !== move) { killer[1] = killer[0]; killer[0] = move; }
+        }
+        break;
+      }
     }
 
-    scored.sort(function (a, b) {
-      return whiteToMove ? b.value - a.value : a.value - b.value;
-    });
+    if (legalMoves === 0) return checked ? -MATE_SCORE + ply : 0;
 
-    // Weaker AIs accept any move within `slack` of their best one.
-    var bestValue = scored[0].value;
+    var flag = best <= originalAlpha ? TT_UPPER : best >= beta ? TT_LOWER : TT_EXACT;
+    if (Math.abs(best) < MATE_LIMIT) ttStore(depth, best, flag, bestMove, ply);
+    return best;
+  }
+
+  function rootSearch(depth, exactAll) {
+    var moves = generateMoves(false);
+    var result = { move: 0, value: -INFINITY, complete: true, scored: [] };
+    if (moves.length === 0) return result;
+    orderMoves(moves, lastBestMove, 0);
+
+    var alpha = -INFINITY;
+    var beta = INFINITY;
+    for (var i = 0; i < moves.length; i++) {
+      var move = moves[i];
+      var mover = side;
+      var alphaBefore = alpha;
+      makeMove(move);
+      if (attacked(kingSquares[mover === WHITE ? 0 : 1], mover === WHITE ? BLACK : WHITE)) {
+        unmakeMove();
+        continue;
+      }
+
+      // A move that walks back into a position already reached in this game is
+      // a draw, so it scores zero instead of being searched.
+      var repeatsGame = !!gameHashCounts[hashLo + ":" + hashHi];
+      var score;
+      if (repeatsGame) {
+        score = 0;
+      } else if (exactAll || result.scored.length === 0) {
+        score = -search(depth - 1, -INFINITY, INFINITY, 1, true);
+      } else {
+        score = -search(depth - 1, -alpha - 1, -alpha, 1, true);
+        if (!searchAborted && score > alpha) score = -search(depth - 1, -INFINITY, -alpha, 1, true);
+      }
+      unmakeMove();
+      if (searchAborted) { result.complete = false; break; }
+
+      // Only an exact score may win the move choice or be treated as a tie:
+      // a fail-low bound is not a real evaluation.
+      var exact = !repeatsGame && (exactAll || result.scored.length === 0 || score > alphaBefore);
+      result.scored.push({ move: move, value: score, exact: exact });
+      if (exact && score > result.value) {
+        result.value = score;
+        result.move = move;
+      }
+      if (score > alpha) alpha = score;
+    }
+    return result;
+  }
+
+  function chooseFromResult(result, slack) {
+    if (!result || !result.move) return 0;
     var window = Math.max(0, slack || 0);
-    var candidates = scored.filter(function (entry) {
-      return Math.abs(entry.value - bestValue) <= window;
-    });
-
-    // The deterministic profile always takes the same tied move, so an identical
-    // position always gets an identical reply and two copies of it draw.
-    if (deterministic) {
-      candidates.sort(function (a, b) {
-        return a.move.san < b.move.san ? -1 : a.move.san > b.move.san ? 1 : 0;
-      });
-      return candidates[0].move;
+    var candidates = [];
+    for (var i = 0; i < result.scored.length; i++) {
+      if (!result.scored[i].exact) continue;
+      if (Math.abs(result.scored[i].value - result.value) <= window) candidates.push(result.scored[i]);
+    }
+    if (candidates.length === 0 || candidates.length === 1) return result.move;
+    if (searchProfile && searchProfile.deterministic) {
+      // Stable, deterministic tie-break: the numeric move encoding.
+      var chosen = candidates[0];
+      for (var j = 1; j < candidates.length; j++) {
+        if (candidates[j].move < chosen.move) chosen = candidates[j];
+      }
+      return chosen.move;
     }
     return candidates[Math.floor(Math.random() * candidates.length)].move;
   }
 
-  function getBestMoveByDepth(g, depth) {
-    return chooseRootMove(g, depth, 0);
+  function runSearch(g, profile, maxDepth) {
+    // A fixed, sound first move: searching the initial position rates several
+    // developing moves as equal, and this keeps the opening sensible.
+    if (g.fen() === "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1") {
+      return { move: encodeMove(20, 52, 0, false, false), value: 0, depth: 0, nodes: 0 };
+    }
+
+    // Positions already seen this game, so the search can avoid repetition.
+    // chess.js history carries no FENs, so replay the moves on a scratch board.
+    gameHashCounts = {};
+    var replayBoard = new Chess();
+    var playedMoves = g.history();
+    try {
+      for (var replayIndex = 0; replayIndex < playedMoves.length; replayIndex++) {
+        replayBoard.move(playedMoves[replayIndex]);
+        loadFen(replayBoard.fen());
+        var afterKey = hashLo + ":" + hashHi;
+        gameHashCounts[afterKey] = (gameHashCounts[afterKey] || 0) + 1;
+      }
+    } catch (replayError) {
+      gameHashCounts = {};
+    }
+
+    loadFen(g.fen());
+    searchProfile = profile;
+    searchNodes = 0;
+    searchNodeLimit = profile.nodes || 0;
+    searchAborted = false;
+    killers = [];
+    historyTable = [];
+    searchQuiesceDepth = profile.quiesceDepth || 4;
+    lastBestMove = 0;
+    ttClear();
+
+    var finished = null;
+    var deepest = 0;
+    for (var depth = 1; depth <= maxDepth; depth++) {
+      var attempt = rootSearch(depth, (profile.slack || 0) > 0);
+      if (attempt.complete && attempt.move) {
+        finished = attempt;
+        deepest = depth;
+        lastBestMove = attempt.move;
+      }
+      if (searchAborted) break;
+    }
+    if (!finished) finished = rootSearch(1, false);
+
+    var chosen = chooseFromResult(finished, profile.slack || 0);
+    searchProfile = null;
+    searchNodeLimit = 0;
+    searchAborted = false;
+    return { move: chosen, value: finished.value, depth: deepest, nodes: searchNodes };
+  }
+
+  // Map an internal move onto the matching chess.js move object, which carries
+  // the SAN text and the flags the rest of the app expects.
+  function toChessJsMove(g, move) {
+    var from = move & 127;
+    var to = (move >> 7) & 127;
+    var promotion = (move >> 14) & 7;
+    var fromSquare = "abcdefgh".charAt(from & 7) + ((from >> 4) + 1);
+    var toSquare = "abcdefgh".charAt(to & 7) + ((to >> 4) + 1);
+    var legal = g.moves({ verbose: true });
+    for (var i = 0; i < legal.length; i++) {
+      var candidate = legal[i];
+      if (candidate.from !== fromSquare || candidate.to !== toSquare) continue;
+      if (promotion && candidate.promotion !== "nbrq".charAt(promotion - KNIGHT)) continue;
+      return candidate;
+    }
+    return legal.length ? legal[0] : null;
   }
 
   function pickBotMove() {
@@ -8955,46 +9811,22 @@ export default {
       return legal[Math.floor(Math.random() * legal.length)];
     }
 
-    searchProfile = currentAi;
-    // The deterministic profile never uses the deadline: an identical position
-    // must always produce an identical move.
-    searchDeadline = currentAi && currentAi.budget && !currentAi.deterministic
-      ? Date.now() + currentAi.budget
-      : 0;
-
-    // Deep profiles search shallower first, then go deeper while time remains,
-    // so a slow machine still returns a strong move quickly.
-    var move;
-    if (currentAi && currentAi.depth >= 4) {
-      var floorDepth = Math.max(2, (currentAi.minDepth || 3) - 1);
-      var started = Date.now();
-      var deadline = started + (currentAi.budget || 1200);
-      move = chooseRootMove(game, floorDepth, currentAi.slack || 0);
-      var spent = Date.now() - started;
-      for (var depth = floorDepth + 1; depth <= currentAi.depth; depth++) {
-        // Each extra ply costs roughly five times the last one. Do not start a
-        // search that would obviously blow past the budget.
-        var first = depth === floorDepth + 1;
-        if (!first && Date.now() + spent * 5 > deadline + 400) break;
-        var depthStart = Date.now();
-        var deeper = chooseRootMove(game, depth, currentAi.slack || 0);
-        if (deeper) move = deeper;
-        spent = Date.now() - depthStart;
-      }
-    } else {
-      move = chooseRootMove(
-        game,
-        currentAi ? currentAi.depth : 2,
-        currentAi ? currentAi.slack : 0
-      );
-    }
-
-    searchProfile = null;
-    searchDeadline = 0;
-    return move;
+    var profile = currentAi || { depth: 2, slack: 0 };
+    var result = runSearch(game, profile, Math.max(1, profile.depth || 2));
+    var move = toChessJsMove(game, result.move);
+    return move || legal[0];
   }
 
-  // ==========================================
+  function evaluateBoard(g) {
+    loadFen(g.fen());
+    return evaluateWhite();
+  }
+
+  function getBestMoveByDepth(g, depth) {
+    var result = runSearch(g, { depth: depth || 3, slack: 0, tables: true, quiesceDepth: 4, nodes: 250000 }, depth || 3);
+    return toChessJsMove(g, result.move);
+  }
+
   // Board plumbing, sound and table talk
   // ==========================================
   // Piece art inlined as data URIs, so the board never fetches images.
@@ -10355,13 +11187,14 @@ export default {
     {
       id: "2400", name: "Grandmaster Voss", rating: 2400, mark: "G",
       tagline: "Sees every exchange through to the end",
-      reward: 25, depth: 4, minDepth: 3, budget: 2600, blunder: 0, slack: 0, tables: true
+      reward: 25, depth: 6, nodes: 220000, blunder: 0, slack: 0, tables: true,
+      quiesceDepth: 4
     },
     {
       id: "3000", name: "The Unbeaten", rating: 3000, mark: "X",
-      tagline: "Plays the same game twice, so it only ever draws itself",
-      reward: 60, depth: 3, blunder: 0, slack: 0, tables: true,
-      quiesce: true, quiesceDepth: 2, deterministic: true
+      tagline: "Searches past every human line and never settles for a draw",
+      reward: 60, depth: 14, nodes: 900000, blunder: 0, slack: 0, tables: true,
+      quiesceDepth: 8, deterministic: true
     }
   ];
 
