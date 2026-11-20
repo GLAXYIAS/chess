@@ -2226,7 +2226,7 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
     <h4>Chat commands</h4>
     <p class="setting-hint">Type one of these in table talk during a local game. Online matches ignore them.</p>
     <p class="setting-hint">"I like nuking people", "Double trouble", "Knight rush", "Promotion party", "Flip it", "I win", "Gravity", "Shuffle up", "Identity crisis", "Rewind", "Teleport".</p>
-    <p class="setting-hint">Admin only: "Time skip", "Pawn storm", "Pawn lottery", "Mirror", "Swap armies".</p>
+    <p class="setting-hint" id="admin-commands-hint" hidden>Admin only: "Time skip", "Pawn storm", "Pawn lottery", "Mirror", "Swap armies".</p>
     <p class="setting-hint">The full phrasebook with every alternative wording lives in the Admin console (duckman).</p>
   </div>
 
@@ -8053,6 +8053,7 @@ export default {
     currentUser = result.player.username;
     currentPassword = password;
     isAdminUser = !!result.admin;
+    lastActivityAt = Date.now();
     localStorage.setItem("chess_current_user", currentUser);
     updateUserChip();
     $("#login-password").val("");
@@ -8147,8 +8148,12 @@ export default {
   }
 
   function syncAdminEntry() {
-    $("#admin-btn").prop("hidden", !adminEntryVisible());
-    $("#settings-admin-btn").prop("hidden", !adminEntryVisible());
+    var visible = adminEntryVisible();
+    var signedInAsAdmin = isAdminUser && currentUser === ADMIN_USERNAME;
+    $("#admin-btn").prop("hidden", !visible);
+    $("#settings-admin-btn").prop("hidden", !visible);
+    // Admin-only command wording stays out of sight for normal accounts.
+    $("#admin-commands-hint").prop("hidden", !signedInAsAdmin);
   }
 
   function closeAdminConsole() {
@@ -8188,6 +8193,7 @@ export default {
       .then(function (result) {
         adminCredentials = { username: username, password: password };
         isAdminUser = true;
+        lastActivityAt = Date.now();
         currentUser = result.player.username;
         currentPassword = password;
         currentAccountData = result.player;
@@ -8463,7 +8469,28 @@ export default {
     toast("Settings restored to defaults.", "success");
   };
 
-  window.logOut = function () {
+  // Accounts time out after 20 minutes without input. The password only ever
+  // lives in memory, so letting an unattended tab keep it indefinitely is the
+  // wrong default.
+  var SESSION_IDLE_MS = 20 * 60 * 1000;
+  var lastActivityAt = Date.now();
+
+  function markActivity() {
+    lastActivityAt = Date.now();
+  }
+
+  ["mousedown", "keydown", "touchstart", "wheel", "pointerdown"].forEach(function (eventName) {
+    document.addEventListener(eventName, markActivity, { passive: true });
+  });
+
+  window.setInterval(function () {
+    if (!currentUser || !currentPassword) return;
+    if (Date.now() - lastActivityAt < SESSION_IDLE_MS) return;
+    logOut("expired");
+  }, 15000);
+
+  window.logOut = function (reason) {
+    var expired = reason === "expired";
     currentUser = "";
     currentPassword = "";
     isAdminUser = false;
@@ -8481,7 +8508,11 @@ export default {
     leaveOnlineMatch(true);
     updateUserChip();
     closeSettingsModal();
-    toast("Signed out.", "success");
+    lastActivityAt = Date.now();
+    toast(
+      expired ? "Session timed out after 20 minutes of inactivity." : "Signed out.",
+      expired ? "warn" : "success"
+    );
     openAccountModal("login");
   };
 
@@ -8692,6 +8723,9 @@ export default {
   // ==========================================
   // Engine
   // ==========================================
+  // The engine keeps every board, hash and search variable in this closure,
+  // so it cannot collide with the UI state (the board widget is `board`).
+  var ChessEngine = (function () {
   // ==========================================
   // Engine: 0x88 board, search and evaluation
   // ==========================================
@@ -9826,6 +9860,15 @@ export default {
     var result = runSearch(g, { depth: depth || 3, slack: 0, tables: true, quiesceDepth: 4, nodes: 250000 }, depth || 3);
     return toChessJsMove(g, result.move);
   }
+
+    return {
+      pickBotMove: pickBotMove,
+      getBestMoveByDepth: getBestMoveByDepth
+    };
+  })();
+
+  function pickBotMove() { return ChessEngine.pickBotMove(); }
+  function getBestMoveByDepth(g, depth) { return ChessEngine.getBestMoveByDepth(g, depth); }
 
   // Board plumbing, sound and table talk
   // ==========================================
