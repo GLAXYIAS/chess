@@ -1123,6 +1123,23 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
     color: var(--muted);
   }
 
+  .remember-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 2px;
+    font-size: 0.74rem;
+    line-height: 1.4;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .remember-row input {
+    width: auto;
+    margin: 0;
+    accent-color: var(--accent);
+  }
+
   .auth-switch {
     margin: 12px 0 0;
     font-size: 0.76rem;
@@ -2061,6 +2078,7 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
     <p class="auth-note">Use a username and password you already created.</p>
     <input type="text" id="login-username" placeholder="Username" maxlength="15" autocomplete="username">
     <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+    <label class="remember-row"><input type="checkbox" id="login-remember" checked> Keep me signed in on this device</label>
     <button class="btn btn-purple btn-submit" id="login-btn" type="submit">Log In</button>
   </form>
 
@@ -2069,11 +2087,12 @@ var Chess=function(r){var u="b",s="w",l=-1,_="p",A="n",S="b",m="r",y="q",p="k",t
     <input type="text" id="register-username" placeholder="Username" maxlength="15" autocomplete="username">
     <input type="password" id="register-password" placeholder="Password" autocomplete="new-password">
     <input type="password" id="register-confirm" placeholder="Confirm password" autocomplete="new-password">
+    <label class="remember-row"><input type="checkbox" id="register-remember" checked> Keep me signed in on this device</label>
     <button class="btn btn-green btn-submit" id="register-btn" type="submit">Create Account</button>
   </form>
 
   <p class="auth-error" id="auth-error"></p>
-  <p class="tip" style="margin-top:12px;">Your password is kept in memory for this session only, never in browser storage.</p>
+  <p class="tip" style="margin-top:12px;">With "Keep me signed in" checked, this browser stores your password so the page can sign you back in automatically. Leave it unchecked on a shared computer.</p>
 </div>
 
 <!-- Admin console: its own sign-in, only the administrator account gets in -->
@@ -7629,8 +7648,36 @@ export default {
   var currentHighlightFen = null;
 
   var currentUser = localStorage.getItem("chess_current_user") || "";
-  // Held in memory only. Passwords are never written to localStorage.
+  // Held in memory for the session. A saved copy is only kept when the player
+  // ticks "Keep me signed in", so returning visits can sign in automatically.
   var currentPassword = "";
+
+  var SAVED_LOGIN_KEY = "chess_saved_login_v1";
+
+  function readSavedLogin() {
+    try {
+      var saved = JSON.parse(localStorage.getItem(SAVED_LOGIN_KEY) || "null");
+      if (saved && typeof saved.username === "string" && typeof saved.password === "string" &&
+          saved.username && saved.password) {
+        return saved;
+      }
+    } catch (err) {
+      // A corrupt or unavailable store just means a normal sign-in.
+    }
+    return null;
+  }
+
+  function saveLoginToDevice(username, password) {
+    try {
+      localStorage.setItem(SAVED_LOGIN_KEY, JSON.stringify({ username: username, password: password }));
+    } catch (err) {
+      // Private mode can refuse writes; the session still works.
+    }
+  }
+
+  function clearSavedLogin() {
+    try { localStorage.removeItem(SAVED_LOGIN_KEY); } catch (err) { /* ignore */ }
+  }
 
   var currentAccountData = {
     username: "",
@@ -8024,7 +8071,12 @@ export default {
   // typo in a login can never create a second account.
   function openAccountModal(tab) {
     switchAuthTab(tab || "login");
-    if (currentUser) $("#login-username").val(currentUser);
+    if (currentUser) {
+      $("#login-username").val(currentUser);
+    } else {
+      var savedLogin = readSavedLogin();
+      if (savedLogin) $("#login-username").val(savedLogin.username);
+    }
     openModal("#account-modal");
   }
 
@@ -8048,13 +8100,15 @@ export default {
     $("#auth-error").text(message || "");
   }
 
-  function finishSignIn(result, password) {
+  function finishSignIn(result, password, remember) {
     currentAccountData = result.player;
     currentUser = result.player.username;
     currentPassword = password;
     isAdminUser = !!result.admin;
     lastActivityAt = Date.now();
     localStorage.setItem("chess_current_user", currentUser);
+    if (remember === false) clearSavedLogin();
+    else saveLoginToDevice(currentUser, password);
     updateUserChip();
     $("#login-password").val("");
     $("#register-password").val("");
@@ -8077,7 +8131,7 @@ export default {
     $("#login-btn").prop("disabled", true);
     workerRequest("/account/login", "POST", { username: username, password: password })
       .then(function (result) {
-        finishSignIn(result, password);
+        finishSignIn(result, password, $("#login-remember").is(":checked"));
         toast("Signed in as " + username + ".", "success");
         if (result.warnings) {
           toast("Admin warning (" + result.warnings + (result.warnings === 1 ? "" : "s") + "): " +
@@ -8115,7 +8169,7 @@ export default {
     $("#register-btn").prop("disabled", true);
     workerRequest("/account/register", "POST", { username: username, password: password })
       .then(function (result) {
-        finishSignIn(result, password);
+        finishSignIn(result, password, $("#register-remember").is(":checked"));
         toast("Account created. Welcome, " + username + ".", "success");
       })
       .catch(function (err) { authError(err.message || "Could not create that account."); })
@@ -8505,6 +8559,9 @@ export default {
       theme: "default"
     };
     try { localStorage.removeItem("chess_current_user"); } catch (err) { /* ignore */ }
+    // A manual sign-out forgets the device. An idle timeout only ends the live
+    // session, so the saved login can still restore it on the next visit.
+    if (!expired) clearSavedLogin();
     leaveOnlineMatch(true);
     updateUserChip();
     closeSettingsModal();
@@ -8590,6 +8647,7 @@ export default {
       currentPassword = newPassword || currentPassword;
       currentAccountData = result.player;
       localStorage.setItem("chess_current_user", currentUser);
+      if (readSavedLogin()) saveLoginToDevice(currentUser, currentPassword);
       updateUserChip();
       $("#new-password-input").val("");
       toast("Account updated.", "success");
@@ -12023,9 +12081,28 @@ export default {
     renderOnlinePanel();
     updateUserChip();
     initPreviewBoard();
-    // Passwords are never returned by the Worker or stored in the browser, so a
-    // returning player signs in again after a reload.
-    openAccountModal();
+    // A saved login is re-checked with the Worker on every load, so the session
+    // comes back without asking for the password again.
+    var savedLogin = readSavedLogin();
+    if (savedLogin) restoreSavedLogin(savedLogin);
+    else openAccountModal();
+  }
+
+  function restoreSavedLogin(saved) {
+    workerRequest("/account/login", "POST", {
+      username: saved.username,
+      password: saved.password
+    }).then(function (result) {
+      finishSignIn(result, saved.password, true);
+    }).catch(function () {
+      clearSavedLogin();
+      currentUser = "";
+      currentPassword = "";
+      try { localStorage.removeItem("chess_current_user"); } catch (err) { /* ignore */ }
+      updateUserChip();
+      openAccountModal();
+      toast("Your saved login no longer works. Sign in again.", "warn");
+    });
   }
 
   checkAccountRequired();
